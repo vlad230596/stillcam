@@ -1,0 +1,591 @@
+#!/usr/bin/env python3
+"""Service panel for the radxa-cam node.
+
+Serves a small control page on :8080 - live telemetry, camera controls applied
+straight through v4l2, and stream parameters that take effect on restart.
+Standard library only: the board may sit on a network with no internet.
+"""
+import http.server
+import json
+import os
+import re
+import socketserver
+import subprocess
+import time
+import urllib.parse
+
+PORT = 8080
+CONF = "/usr/local/etc/cam-stream.conf"
+# The stream reads the ISP self path; the main path stays free for full-frame
+# measurement stills (host/still.py), taken while the stream keeps running.
+STREAM_DEVICE = "/dev/video1"
+# Sensor controls (exposure, gain...) are the IMX219's own and show up on every
+# video node of the ISP with the same values; /dev/video0 is where still.py and
+# snap.ps1 set them too, so the panel uses it as well.
+DEVICE = "/dev/video0"
+
+# Controls we expose, in the order they appear on the page.
+CONTROLS = [
+    ("exposure",        "Exposure",              "lines"),
+    ("gain",            "Gain",                  ""),
+    ("analogue_gain",   "Analogue gain",         ""),
+    ("horizontal_flip", "Horizontal flip",       ""),
+    ("vertical_flip",   "Vertical flip",         ""),
+    ("test_pattern",    "Test pattern",          ""),
+]
+
+MODES_FILE = "/usr/local/etc/cam-modes.conf"
+
+NICE_NAMES = {
+    (3280, 2464): "full frame, 8 MP",
+    (1920, 1088): "almost Full HD",
+    (1600, 1200): "2 MP 4:3",
+    (1280, 720):  "HD",
+    (640, 480):   "VGA",
+}
+
+
+def sensor_modes():
+    """The sensor's own modes, as discovered by cam-probe-modes."""
+    modes = []
+    try:
+        with open(MODES_FILE) as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                size, fps, sensor = line.split()
+                w, h = (int(x) for x in size.split("x"))
+                sw, sh = (int(x) for x in sensor.split("x"))
+                note = NICE_NAMES.get((w, h), "")
+                label = "%d×%d, %s fps" % (w, h, fps)
+                if note:
+                    label += " — " + note
+                modes.append([w, h, int(fps), label, sw, sh])
+    except Exception:
+        modes = [[1920, 1088, 21, "1920×1088, 21 fps", 3280, 2464]]
+    modes.sort(key=lambda m: -(m[0] * m[1]))
+    return modes
+
+
+def sh(cmd):
+    try:
+        return subprocess.run(cmd, shell=True, capture_output=True, text=True,
+                              timeout=15).stdout.strip()
+    except Exception:
+        return ""
+
+
+def read_int(path, div=1):
+    try:
+        with open(path) as f:
+            return int(f.read().strip()) // div
+    except Exception:
+        return None
+
+
+def load_conf():
+    conf = {"WIDTH": 1920, "HEIGHT": 1088, "FPS": 21, "SENSOR_W": 3280, "SENSOR_H": 2464,
+            "BITRATE": 6000000, "GOP": 30, "DEVICE": STREAM_DEVICE}
+    try:
+        with open(CONF) as f:
+            for line in f:
+                line = line.strip()
+                if line and not line.startswith("#") and "=" in line:
+                    k, v = line.split("=", 1)
+                    if k == "DEVICE":
+                        conf[k] = v.strip()
+                    elif k in conf:
+                        try:
+                            conf[k] = int(v)
+                        except ValueError:
+                            pass
+    except Exception:
+        pass
+    return conf
+
+
+def save_conf(new):
+    conf = load_conf()
+    # DEVICE is not taken from the page: it is a node path that goes into a
+    # shell command line, and the page has no business choosing it.
+    conf.update({k: int(v) for k, v in new.items() if k in conf and k != "DEVICE"})
+    with open(CONF, "w") as f:
+        f.write("# Stream parameters. Changing these requires restarting mediamtx.\n")
+        for k, v in conf.items():
+            f.write("%s=%s\n" % (k, v))
+    return conf
+
+
+def camera_controls():
+    """Current values and ranges, parsed from v4l2-ctl."""
+    out = sh("v4l2-ctl -d %s --list-ctrls" % DEVICE)
+    found = {}
+    for line in out.splitlines():
+        m = re.match(r"\s*(\w+)\s+0x[0-9a-f]+\s+\((\w+)\)\s*:\s*(.*)", line)
+        if not m:
+            continue
+        name, ctype, rest = m.group(1), m.group(2), m.group(3)
+        item = {"type": ctype}
+        for key in ("min", "max", "step", "default", "value"):
+            mm = re.search(r"\b%s=(-?\d+)" % key, rest)
+            if mm:
+                item[key] = int(mm.group(1))
+        found[name] = item
+    return found
+
+
+def set_autoexposure(on):
+    """Toggle the 3A daemon, restarting the pipeline around it.
+
+    The order matters, and getting it wrong is what made the stream go mono.
+    rkaiq_3A_server latches onto the ISP only on the stream-start event it
+    receives from /dev/video9. Touch it while the pipeline is already running
+    and both directions break: killed mid-stream it leaves the ISP with default
+    params and the picture turns grey, started mid-stream it either sits in
+    "wait stream start event" forever or spins on "stats disorder" - either way
+    no colour and no auto exposure until the pipeline is restarted.
+
+    So the daemon is only ever switched while mediamtx is down. Cost is the
+    same few seconds of stream gap a mode change already has.
+    """
+    # Already in the requested mode: nothing to do, and restarting anyway costs a
+    # stream gap on every call - scripts ask for manual mode before each shot.
+    if (sh("systemctl is-active rkaiq_3A") == "active") == on:
+        return {"ok": True, "on": on, "restarted": False, "kept": {}}
+
+    streaming = sh("systemctl is-active mediamtx") == "active"
+
+    # Going manual, freeze what 3A had converged on: restarting the pipeline
+    # resets the sensor to driver defaults (exposure 158, analogue_gain 256),
+    # which is a near-black frame and looks like a second bug.
+    keep = {}
+    if not on:
+        ctrls = camera_controls()
+        for name in ("exposure", "gain", "analogue_gain"):
+            if name in ctrls and "value" in ctrls[name]:
+                keep[name] = ctrls[name]["value"]
+
+    if streaming:
+        subprocess.run(["systemctl", "stop", "mediamtx"], timeout=45)
+    # restart rather than start: a daemon left stuck by an older toggle has to
+    # go away first, and restart is a no-op cost when it was not running
+    subprocess.run(["systemctl", "restart" if on else "stop", "rkaiq_3A"], timeout=45)
+    if streaming:
+        subprocess.run(["systemctl", "start", "mediamtx"], timeout=45)
+        if keep:
+            time.sleep(4)   # the pipeline has to open its video node first
+            for name, value in keep.items():
+                sh("v4l2-ctl -d %s --set-ctrl=%s=%d" % (DEVICE, name, value))
+
+    return {"ok": True, "on": on, "restarted": streaming, "kept": keep}
+
+
+def status():
+    temp = read_int("/sys/class/thermal/thermal_zone0/temp", 1000)
+    cpu = read_int("/sys/devices/system/cpu/cpu0/cpufreq/scaling_cur_freq", 1000)
+    ddr = read_int("/sys/class/devfreq/dmc/cur_freq", 1000000)
+
+    fan_cur = fan_max = None
+    for d in sorted(os.listdir("/sys/class/thermal")):
+        if d.startswith("cooling_device"):
+            p = "/sys/class/thermal/" + d
+            try:
+                with open(p + "/type") as f:
+                    if f.read().strip() == "pwm-fan":
+                        fan_cur = read_int(p + "/cur_state")
+                        fan_max = read_int(p + "/max_state")
+            except Exception:
+                pass
+
+    try:
+        with open("/proc/loadavg") as f:
+            load = f.read().split()[0]
+    except Exception:
+        load = "?"
+    try:
+        with open("/proc/uptime") as f:
+            up = int(float(f.read().split()[0]))
+    except Exception:
+        up = 0
+    mem = None
+    try:
+        with open("/proc/meminfo") as f:
+            for line in f:
+                if line.startswith("MemAvailable"):
+                    mem = int(line.split()[1]) // 1024
+    except Exception:
+        pass
+
+    stream = sh("systemctl is-active mediamtx") or "unknown"
+    publishing = sh("pgrep -c gst-launch-1.0") not in ("", "0")
+
+    # measured by fpsdisplaysink inside the pipeline - the delivered rate, not the
+    # one we asked for
+    fps = None
+    if publishing:
+        try:
+            with open("/run/cam-fps") as f:
+                fps = round(float(f.read().strip()), 1)
+        except Exception:
+            fps = None
+
+    # the rkaiq 3A daemon drives auto exposure; stopping it is the only way to
+    # make manual exposure and gain stick
+    autoexposure = sh("systemctl is-active rkaiq_3A") == "active"
+
+    return {
+        "temp": temp, "cpu": cpu, "ddr": ddr,
+        "fan": fan_cur, "fan_max": fan_max,
+        "load": load, "uptime": up, "mem": mem,
+        "stream": stream, "publishing": "yes" if publishing else "no",
+        "fps": fps, "autoexposure": autoexposure,
+        "conf": load_conf(),
+        "controls": camera_controls(),
+        "modes": sensor_modes(),
+        "host": sh("hostname"),
+    }
+
+
+PAGE = r"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>radxa-cam</title>
+<style>
+  :root {
+    --bg: #f6f7f9; --card: #ffffff; --ink: #14181f; --muted: #667085;
+    --line: #e3e6ea; --accent: #2f6fed; --ok: #1a7f52; --warn: #b7791f; --bad: #c0392b;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --bg: #12151a; --card: #1a1f26; --ink: #e8ecf1; --muted: #98a2b3;
+      --line: #2a313b; --accent: #6ea0ff; --ok: #4ec38a; --warn: #e0b050; --bad: #ef6b5a;
+    }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--ink);
+         font: 15px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }
+  .wrap { max-width: 920px; margin: 0 auto; padding: 24px 16px 64px; }
+  h1 { font-size: 20px; margin: 0 0 2px; letter-spacing: -0.01em; }
+  .sub { color: var(--muted); font-size: 13px; margin-bottom: 20px; }
+  .card { background: var(--card); border: 1px solid var(--line); border-radius: 12px;
+          padding: 18px; margin-bottom: 16px; }
+  .card h2 { font-size: 13px; text-transform: uppercase; letter-spacing: 0.06em;
+             color: var(--muted); margin: 0 0 14px; font-weight: 600; }
+  .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(120px, 1fr)); gap: 14px; }
+  .metric .v { font-size: 22px; font-weight: 600; font-variant-numeric: tabular-nums; }
+  .metric .k { font-size: 12px; color: var(--muted); }
+  .row { display: flex; align-items: center; gap: 12px; margin-bottom: 14px; flex-wrap: wrap; }
+  .row label { flex: 0 0 190px; font-size: 14px; }
+  .row input[type=range] { flex: 1 1 200px; accent-color: var(--accent); }
+  .row .num { flex: 0 0 76px; text-align: right; font-variant-numeric: tabular-nums;
+              color: var(--muted); font-size: 13px; }
+  select, input[type=number] { background: var(--bg); color: var(--ink); border: 1px solid var(--line);
+           border-radius: 8px; padding: 7px 10px; font: inherit; font-size: 14px; }
+  button { background: var(--accent); color: #fff; border: 0; border-radius: 8px;
+           padding: 9px 16px; font: inherit; font-weight: 500; cursor: pointer; }
+  button.ghost { background: transparent; color: var(--accent); border: 1px solid var(--line); }
+  button:active { transform: translateY(1px); }
+  a { color: var(--accent); }
+  .pill { font-size: 12px; padding: 2px 9px; border-radius: 999px; border: 1px solid var(--line); }
+  .ok { color: var(--ok); } .warn { color: var(--warn); } .bad { color: var(--bad); }
+  .note { font-size: 13px; color: var(--muted); margin-top: 10px; }
+  .actions { display: flex; gap: 10px; align-items: center; margin-top: 6px; flex-wrap: wrap; }
+  .switch { display: inline-flex; align-items: center; gap: 9px; cursor: pointer; font-size: 14px; color: var(--muted); }
+  .switch input { width: 18px; height: 18px; accent-color: var(--accent); cursor: pointer; }
+  .switch { display: inline-flex; align-items: center; gap: 9px; cursor: pointer; font-size: 14px; color: var(--muted); }
+  .switch input { width: 18px; height: 18px; accent-color: var(--accent); cursor: pointer; }
+  #toast { position: fixed; left: 50%; bottom: 24px; transform: translateX(-50%);
+           background: var(--ink); color: var(--card); padding: 10px 18px; border-radius: 8px;
+           font-size: 14px; opacity: 0; transition: opacity .25s; pointer-events: none; }
+  #toast.show { opacity: 1; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>radxa-cam</h1>
+  <div class="sub" id="sub">service panel</div>
+
+  <div class="card">
+    <h2>Status</h2>
+    <div class="grid" id="metrics"></div>
+    <div class="actions" style="margin-top:16px">
+      <a href="#" id="live" target="_blank"><button class="ghost">Watch stream</button></a>
+      <a href="#" id="focus" target="_blank"><button class="ghost">Focus (full frame)</button></a>
+      <button id="btnStart" onclick="act('start')">Start stream</button>
+      <button class="ghost" id="btnStop" onclick="act('stop')">Stop stream</button>
+      <button class="ghost" onclick="act('restart')">Restart</button>
+    </div>
+  </div>
+
+  <div class="card">
+    <h2>Camera — applied immediately</h2>
+    <div class="row">
+      <label for="ae">Auto exposure</label>
+      <label class="switch"><input type="checkbox" id="ae" onchange="setAE(this.checked)"> <span id="aeState">—</span></label>
+    </div>
+    <div id="controls"></div>
+    <div class="note">Auto exposure is driven by the 3A service. While the box is checked, exposure
+      and gain set by hand live for a fraction of a second and are overwritten back —
+      uncheck it and the values stay fixed (the current ones are kept as they are).
+      <b>Switching interrupts the stream for a few seconds:</b> the 3A service may only be touched
+      while the pipeline is stopped, otherwise the picture stays without colour. The other controls
+      are applied immediately and do not touch the stream.</div>
+  </div>
+
+  <div class="card">
+    <h2>Stream — restart required</h2>
+    <div class="row">
+      <label for="res">Sensor mode</label>
+      <select id="res"></select>
+    </div>
+    <div class="row">
+      <label for="bitrate">Bitrate, Mbit/s</label>
+      <input type="number" id="bitrate" min="0.5" max="40" step="0.5" style="width:110px">
+    </div>
+    <div class="row">
+      <label for="gop">Keyframe interval</label>
+      <input type="number" id="gop" min="1" max="300" step="1" style="width:110px">
+    </div>
+    <div class="actions">
+      <button onclick="applyStream()">Apply and restart</button>
+      <span class="note" style="margin:0">The stream will be interrupted for a few seconds</span>
+    </div>
+    <div class="note">The list contains only modes verified to encode the frame <b>without the RGA block</b>:
+      its driver has a bug that corrupts kernel memory, and any use of it sooner or later
+      crashes the board. Hence both frame sides are multiples of 16, and 1920×1080 is absent — 1080 is not divisible by 16,
+      1920×1088 is offered instead.
+    </div>
+  </div>
+</div>
+<div id="toast"></div>
+
+<script>
+let toastTimer = null;
+function toast(msg) {
+  const t = document.getElementById('toast');
+  t.textContent = msg; t.classList.add('show');
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => t.classList.remove('show'), 2200);
+}
+function fmtUptime(s) {
+  const d = Math.floor(s/86400), h = Math.floor(s%86400/3600), m = Math.floor(s%3600/60);
+  if (d) return d + ' d ' + h + ' h';
+  if (h) return h + ' h ' + m + ' min';
+  return m + ' min';
+}
+function tempClass(t) { return t >= 85 ? 'bad' : (t >= 75 ? 'warn' : 'ok'); }
+
+let built = false;
+async function refresh() {
+  let s;
+  try { s = await (await fetch('/api/status')).json(); }
+  catch (e) { document.getElementById('sub').textContent = 'no connection to the board'; return; }
+
+  document.getElementById('sub').textContent =
+    s.host + ' · uptime ' + fmtUptime(s.uptime);
+  document.getElementById('live').href = 'http://' + location.hostname + ':8889/cam';
+  document.getElementById('focus').href = 'http://' + location.hostname + ':8081/focus';
+
+  const fan = (s.fan === null || s.fan === undefined) ? '—' : s.fan + '/' + s.fan_max;
+  document.getElementById('metrics').innerHTML = [
+    ['Temperature', '<span class="' + tempClass(s.temp) + '">' + s.temp + ' °C</span>'],
+    ['Frame rate', (s.fps === null ? '—' : s.fps + ' fps')],
+    ['CPU clock', s.cpu + ' MHz'],
+    ['Memory clock', s.ddr + ' MHz'],
+    ['Fan', fan],
+    ['Load', s.load],
+    ['Free RAM', s.mem + ' MB'],
+    ['Server', '<span class="' + (s.stream === 'active' ? 'ok' : 'bad') + '">' + s.stream + '</span>'],
+    ['Encoder', '<span class="' + (s.publishing === 'yes' ? 'ok' : 'bad') + '">' + s.publishing + '</span>'],
+  ].map(([k, v]) => '<div class="metric"><div class="v">' + v + '</div><div class="k">' + k + '</div></div>').join('');
+
+  const running = (s.stream === 'active');
+  document.getElementById('btnStart').style.display = running ? 'none' : '';
+  document.getElementById('btnStop').style.display = running ? '' : 'none';
+  const ae = document.getElementById('ae');
+  if (document.activeElement !== ae) ae.checked = s.autoexposure;
+  document.getElementById('aeState').textContent = s.autoexposure ? 'on' : 'off, manual mode';
+
+  if (!built) buildForms(s);
+}
+
+const LABELS = __LABELS__;
+
+function buildForms(s) {
+  built = true;
+  const box = document.getElementById('controls');
+  box.innerHTML = '';
+  for (const [name, label, unit] of LABELS) {
+    const c = s.controls[name];
+    if (!c) continue;
+    const row = document.createElement('div');
+    row.className = 'row';
+    if (c.type === 'bool') {
+      row.innerHTML = '<label for="c_' + name + '">' + label + '</label>' +
+        '<select id="c_' + name + '"><option value="0">off</option><option value="1">on</option></select>';
+      row.querySelector('select').value = String(c.value);
+      row.querySelector('select').onchange = e => setCtrl(name, e.target.value);
+    } else if (c.type === 'menu' || c.type === 'intmenu') {
+      let opts = '';
+      for (let i = c.min; i <= c.max; i++) opts += '<option value="' + i + '">' + (i === 0 ? 'off' : 'No. ' + i) + '</option>';
+      row.innerHTML = '<label for="c_' + name + '">' + label + '</label><select id="c_' + name + '">' + opts + '</select>';
+      row.querySelector('select').value = String(c.value);
+      row.querySelector('select').onchange = e => setCtrl(name, e.target.value);
+    } else {
+      row.innerHTML = '<label for="c_' + name + '">' + label + '</label>' +
+        '<input type="range" id="c_' + name + '" min="' + c.min + '" max="' + c.max + '" step="' + (c.step || 1) + '" value="' + c.value + '">' +
+        '<span class="num" id="n_' + name + '">' + c.value + ' ' + unit + '</span>';
+      const inp = row.querySelector('input');
+      inp.oninput = e => document.getElementById('n_' + name).textContent = e.target.value + ' ' + unit;
+      inp.onchange = e => setCtrl(name, e.target.value);
+    }
+    box.appendChild(row);
+  }
+
+  const res = document.getElementById('res');
+  res.innerHTML = s.modes.map(m => '<option value="' + [m[0],m[1],m[2],m[4],m[5]].join('x') + '">' + m[3] + '</option>').join('');
+  res.value = [s.conf.WIDTH, s.conf.HEIGHT, s.conf.FPS, s.conf.SENSOR_W, s.conf.SENSOR_H].join('x');
+  document.getElementById('bitrate').value = (s.conf.BITRATE / 1000000).toFixed(1);
+  document.getElementById('gop').value = s.conf.GOP;
+}
+
+async function setCtrl(name, value) {
+  const r = await fetch('/api/camera', {
+    method: 'POST', headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({name, value: Number(value)})
+  });
+  const j = await r.json();
+  toast(j.ok ? (name + ' → ' + value) : ('failed: ' + (j.error || '')));
+}
+
+async function applyStream() {
+  const [w, h, f, sw, sh] = document.getElementById('res').value.split('x');
+  const body = {
+    WIDTH: Number(w), HEIGHT: Number(h), FPS: Number(f),
+    SENSOR_W: Number(sw), SENSOR_H: Number(sh),
+    BITRATE: Math.round(Number(document.getElementById('bitrate').value) * 1000000),
+    GOP: Number(document.getElementById('gop').value)
+  };
+  toast('restarting the stream…');
+  const r = await fetch('/api/stream', {
+    method: 'POST', headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify(body)
+  });
+  const j = await r.json();
+  toast(j.ok ? 'applied' : ('error: ' + (j.error || '')));
+  built = false;
+}
+
+async function setAE(on) {
+  toast((on ? 'enabling auto exposure' : 'disabling auto exposure') + ', restarting the stream…');
+  const r = await fetch('/api/autoexposure', {
+    method: 'POST', headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({on})
+  });
+  const j = await r.json();
+  toast(j.ok ? (on ? 'auto exposure on' : 'manual mode: values are held') : ('error: ' + (j.error || '')));
+  built = false;
+}
+
+async function act(what) {
+  toast(what === 'stop' ? 'stopping…' : (what === 'start' ? 'starting…' : 'restarting…'));
+  const r = await fetch('/api/action', {
+    method: 'POST', headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({action: what})
+  });
+  const j = await r.json();
+  toast(j.ok ? 'done' : 'error');
+}
+
+refresh();
+setInterval(refresh, 2000);
+</script>
+</body>
+</html>
+"""
+
+
+class Handler(http.server.BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+
+    def log_message(self, *args):
+        pass
+
+    def _send(self, code, body, ctype="application/json; charset=utf-8"):
+        data = body.encode("utf-8") if isinstance(body, str) else body
+        self.send_response(code)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(data)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(data)
+
+    def do_GET(self):
+        path = urllib.parse.urlparse(self.path).path
+        if path == "/":
+            page = PAGE.replace("__LABELS__", json.dumps(CONTROLS, ensure_ascii=False))
+            self._send(200, page, "text/html; charset=utf-8")
+        elif path == "/api/status":
+            self._send(200, json.dumps(status(), ensure_ascii=False))
+        else:
+            self._send(404, json.dumps({"error": "not found"}))
+
+    def do_POST(self):
+        path = urllib.parse.urlparse(self.path).path
+        length = int(self.headers.get("Content-Length", 0))
+        try:
+            payload = json.loads(self.rfile.read(length) or b"{}")
+        except Exception:
+            self._send(400, json.dumps({"ok": False, "error": "bad json"}))
+            return
+
+        if path == "/api/camera":
+            name = str(payload.get("name", ""))
+            value = int(payload.get("value", 0))
+            if not re.fullmatch(r"[a-z_]+", name):
+                self._send(400, json.dumps({"ok": False, "error": "bad control"}))
+                return
+            err = sh("v4l2-ctl -d %s --set-ctrl=%s=%d 2>&1" % (DEVICE, name, value))
+            self._send(200, json.dumps({"ok": err == "", "error": err}, ensure_ascii=False))
+
+        elif path == "/api/stream":
+            try:
+                before = load_conf()
+                conf = save_conf(payload)
+                # same parameters as the running stream - do not break it for nothing
+                restart = conf != before or sh("systemctl is-active mediamtx") != "active"
+                if restart:
+                    subprocess.run(["systemctl", "restart", "mediamtx"], timeout=30)
+                self._send(200, json.dumps({"ok": True, "conf": conf, "restarted": restart}))
+            except Exception as e:
+                self._send(500, json.dumps({"ok": False, "error": str(e)}))
+
+        elif path == "/api/action":
+            action = payload.get("action")
+            if action in ("start", "stop", "restart"):
+                subprocess.run(["systemctl", action, "mediamtx"], timeout=45)
+                self._send(200, json.dumps({"ok": True, "action": action}))
+            else:
+                self._send(400, json.dumps({"ok": False, "error": "unknown action"}))
+
+        elif path == "/api/autoexposure":
+            on = bool(payload.get("on"))
+            try:
+                self._send(200, json.dumps(set_autoexposure(on), ensure_ascii=False))
+            except Exception as e:
+                self._send(500, json.dumps({"ok": False, "error": str(e)}))
+        else:
+            self._send(404, json.dumps({"error": "not found"}))
+
+
+class Server(socketserver.ThreadingTCPServer):
+    allow_reuse_address = True
+    daemon_threads = True
+
+
+if __name__ == "__main__":
+    with Server(("", PORT), Handler) as httpd:
+        httpd.serve_forever()

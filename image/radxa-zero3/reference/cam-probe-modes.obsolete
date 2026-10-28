@@ -1,0 +1,51 @@
+#!/bin/bash
+# Ask the sensor which modes it actually has, and write them to
+# /usr/local/etc/cam-modes.conf as "WIDTHxHEIGHT FPS" lines.
+#
+# The Rockchip imx219 driver does not implement VIDIOC_SUBDEV_ENUM_FRAME_SIZE,
+# so enumeration is done by asking for a spread of sizes and recording what the
+# driver snaps each one to. Anything not in its internal table lands on the
+# nearest mode, so the distinct answers are exactly the real modes.
+#
+# Streaming is stopped for the duration: the sensor format cannot be probed
+# while the pipeline holds it.
+set -u
+OUT=/usr/local/etc/cam-modes.conf
+ENTITY='"m00_b_imx219 2-0010":0'
+MEDIA=/dev/media0
+CANDIDATES="3280x2464 2592x1944 1920x1440 1920x1080 1640x1232 1640x922 1332x990 1280x960 1280x720 800x600 640x480 320x240"
+
+was_active=$(systemctl is-active mediamtx)
+[ "$was_active" = "active" ] && systemctl stop mediamtx && sleep 3
+
+current=$(media-ctl -d "$MEDIA" --get-v4l2 "$ENTITY" 2>/dev/null | grep -oE "[0-9]+x[0-9]+" | head -1)
+
+tmp=$(mktemp)
+for s in $CANDIDATES; do
+    w=${s%x*}; h=${s#*x}
+    media-ctl -d "$MEDIA" --set-v4l2 "$ENTITY[fmt:SRGGB10_1X10/${w}x${h}]" >/dev/null 2>&1
+    got=$(media-ctl -d "$MEDIA" --get-v4l2 "$ENTITY" 2>/dev/null | grep -oE "SRGGB10_1X10/[0-9]+x[0-9]+@[0-9]+/[0-9]+")
+    size=$(echo "$got" | grep -oE "[0-9]+x[0-9]+" | head -1)
+    iv=$(echo "$got" | grep -oE "@[0-9]+/[0-9]+" | tr -d "@")
+    num=${iv%/*}; den=${iv#*/}
+    [ -z "$size" ] && continue
+    [ -z "${num:-}" ] && continue
+    [ "$num" = "0" ] && continue
+    fps=$(awk "BEGIN{printf \"%d\", ($den/$num)+0.5}")
+    echo "$size $fps" >> "$tmp"
+done
+
+# restore whatever the sensor was on before probing
+[ -n "$current" ] && media-ctl -d "$MEDIA" --set-v4l2 "$ENTITY[fmt:SRGGB10_1X10/${current}]" >/dev/null 2>&1
+
+{
+    echo "# Sensor modes discovered by cam-probe-modes on $(date -Is)"
+    echo "# Format: WIDTHxHEIGHT FPS   (these are the sensor's own modes, nothing else)"
+    sort -u -t x -k1,1nr "$tmp" | sort -u
+} > "$OUT"
+rm -f "$tmp"
+
+[ "$was_active" = "active" ] && systemctl start mediamtx
+
+echo "Modes written to $OUT:"
+grep -v "^#" "$OUT"

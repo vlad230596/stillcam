@@ -1,0 +1,11 @@
+[Unit]
+Description=radxa-cam service panel
+After=network.target
+
+[Service]
+ExecStart=/usr/bin/python3 /usr/local/bin/cam-panel
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target

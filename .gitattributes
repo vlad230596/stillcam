@@ -1,0 +1,6 @@
+# Everything that runs on the board must keep LF: a CR breaks shebangs and
+# provision.sh refuses a bundle with CRLF in it.
+* text=auto eol=lf
+*.ps1 text eol=crlf
+*.img binary
+*.xz binary

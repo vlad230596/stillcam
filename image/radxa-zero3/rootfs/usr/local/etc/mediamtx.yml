@@ -1,0 +1,6 @@
+logLevel: info
+
+paths:
+  cam:
+    runOnInit: /usr/local/bin/cam-pipeline
+    runOnInitRestart: yes

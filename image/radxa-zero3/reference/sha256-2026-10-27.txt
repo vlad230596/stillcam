@@ -1,0 +1,11 @@
+768f41c7e3dfc49a4bca46725d8a05278d83f8bd6224ef03a5cbc3266c17212a  /usr/local/bin/cam-blackbox
+6951f468cf1ffff27a0944a5f96b206b1b8e74b5a7cf3638d01fb8bcc4e19f14  /usr/local/bin/cam-panel
+e7dd100a2c713e2bdf462808abbd2807da925f7ff6b68532a72628968508c303  /usr/local/bin/cam-panel.bak
+2ebb945f3fad8c42a8212a77d192c54e78258cc2ee7f06380ed314b7e60fcead  /usr/local/bin/cam-pipeline
+30cbc8e5b6bc7817838c5dd372a38b4b5ea5b282ba654ac67e34ce31c8d40423  /usr/local/bin/cam-probe-modes
+a6bc63f40c2f0892c08fb47cc300897ba04cec538ed5451cf71ad65725df0027  /usr/local/bin/cam-still
+076cc5d94c855124c57fe62f49e522aeaaa74e9974015e9fa9c31def6b5008b8  /usr/local/bin/cam-still.v1
+e47c58c398adbcaa2cbd545fdd908b9c2e36db4c7a4590fd2e746d3cbf28ae6b  /usr/local/bin/mediamtx
+6d2e9e180ed57f14d670f67c99c2e2f0601561df0c86d2a5fbd338cb88bad4f8  /usr/local/etc/cam-modes.conf
+c1e6452acc7a16d35faf7d15badc9363b748443b19b01bc4cf476844b1841afa  /usr/local/etc/cam-stream.conf
+840905f1119477b63c9f49524dd56268491722f438f5571d7e9dcece0f63f9ba  /usr/local/etc/mediamtx.yml

@@ -1,0 +1,11 @@
+[project]
+name = "stillcam"
+version = "0.1.0"
+description = "Network camera for machine vision: full-frame stills, live RTSP stream, focus aid, provisioning from a stock SBC image."
+requires-python = ">=3.11"
+# Host side only (host/still.py). Everything under node/ runs on the board with the
+# system python3 and the standard library; tests/ need nothing beyond the standard library.
+dependencies = ["numpy>=2.0"]
+
+[tool.uv]
+package = false

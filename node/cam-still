@@ -1,0 +1,1064 @@
+#!/usr/bin/env python3
+"""Still service for the radxa-cam node: raw NV12 frames from the ISP main path.
+
+    GET /still?frames=N   N raw NV12 frames 3280x2464 from /dev/video0, back to back
+    GET /still?frames=N&fresh=1[&skip=K][&settle=M][&keep=S]
+                          series mode: the main path keeps streaming between
+                          requests, the answer is the next N frames whose
+                          exposure started after the request came in
+    GET /series/stop      stop the series stream now (otherwise it stops by itself)
+    GET /focus            focus set-up page (cam-still 3): live full-resolution crops + sharpness
+    GET /focus/stream?rects=x,y,w,h;...&ov=8
+                          endless stream of FCS1 packets, the newest frame each time
+    GET /status           JSON: busy, device, size, autoexposure, series, focus
+
+Runs permanently (systemd unit cam-still.service) and replaces the per-shot ssh
+upload of still_grab.py. It is deliberately dumb: it never chooses exposure or
+gain - those are set through the panel (cam-panel, :8080, POST /api/camera) -
+and it does no processing. Averaging, colour, black level and PNG are done on
+the PC (host/still.py, or a client application).
+
+The capture is exactly still_grab.py's (docs/radxa-zero3.md, "Measurement
+still"):
+  * v4l2-ctl --stream-mmap=4 --stream-skip=PRE+POST --stream-count=N --stream-to=-
+    writes the frames straight into the client socket; Python never touches
+    the pixel data (a Python relay tops out at ~90 MB/s, v4l2-ctl hits the
+    gigabit ceiling at ~116 MB/s);
+  * after PRE frames the CURRENT sensor controls are written back as "the
+    neighbour value, then the value itself" - right after a pipeline start the
+    sensor may not hold the cached value, and v4l2 does not write a value that
+    equals its cache. The values are the ones read before the capture, so the
+    service still does not choose anything;
+  * POST more frames are discarded while the controls settle (measured: 4 is
+    enough even with a full v4l2 queue).
+
+It must never disturb the live stream: the stream runs on the self path
+(/dev/video1) and both ISP outputs work in parallel. If the stream sits on the
+main path itself (modes wider than 1920), the service refuses with 503 instead
+of stopping it - still.py stops the stream in that case, this service does not.
+The codec and RGA are never involved (docs/radxa-zero3.md, pitfall 1); the
+sensor mode is never pinned (pitfall 2); frame sizes must be multiples of 16.
+
+Response body (Content-Length is exact, so a short read on the client side
+means the capture broke):
+    "STL1"                  4 bytes, magic
+    uint32 LE               length L of the JSON header
+    L bytes UTF-8 JSON      {"format":"NV12","width","height","stride",
+                             "frame_bytes","frames","skip","controls":{...},
+                             "device","service"}
+    frames x frame_bytes    NV12: Y plane (height rows x stride), then the
+                            interleaved UV plane (height/2 rows x stride)
+
+Series mode (cam-still 2, 2026-09-30). A measurement series (for example, a
+calibration grid of a moving light spot) takes dozens of short stills in a row; restarting v4l2-ctl for each one
+costs ~0.9 s (set-fmt, get-ctrl, first frame 0.17 s, warm-up 0.5 s). With
+fresh=1 the service starts ONE v4l2-ctl stream on the main path and keeps it
+until no fresh request came for `keep` seconds (default 10, max 60):
+  * v4l2-ctl writes frames into a pipe, a reader thread keeps the last RING
+    frames with their sequence numbers; the time a frame was dequeued comes
+    from the '<' marks on stderr;
+  * a request waits for frames dequeued after it arrived, drops `skip` of them
+    (default 2: the first one may have started exposing before the request -
+    the scene was still changing) and `settle` more if the client has just
+    changed the controls through the panel (like POST), then sends N frames;
+  * at stream start the controls are reasserted after the first frame and 4
+    frames are dropped, exactly like the one-shot capture;
+  * a request without fresh=1 stops the series first and then works as before,
+    so old clients see no difference; an old service ignores fresh=1, so a new
+    client works with it too (just slower);
+  * the pipe relay is Python (~90 MB/s, docs/radxa-zero3.md): for the 1-2
+    frames of a series shot that is 0.13-0.27 s, much less than the restart.
+
+Focus mode (cam-still 3, 2026-10-20). The compressed live stream is useless for
+judging focus, the full frame is 12 MB. /focus/stream rides the series stream
+and sends, for the newest frame each time (frames in between are dropped, so a
+slow client never builds a backlog), the Y bytes of up to 8 crops (side 16..512,
+pushed inside the frame) and a Y overview decimated by ov (2/4/8/16, 0 - none):
+    "FCS1", uint32 LE length L, L bytes JSON {"seq","dropped","fps","controls",
+    "width","height","rects":[[x,y,w,h]...],"overview":[w,h,step]?,"service"},
+    then the crops row by row in order, then the overview.
+It holds LOCK while it runs (stills get 409 busy naming the focus client); a new
+/focus/stream takes over from the previous one, which ends on its next frame.
+A client gone silently is dropped by a 5 s send timeout. The page (GET /focus)
+computes sharpness in the browser.
+
+Errors are JSON {"error": code, "message": text}:
+    400 bad_request      bad parameters
+    409 busy             another capture is running (one at a time)
+    409 autoexposure     rkaiq_3A is running - switch to manual via the panel
+    503 main_path_busy   the live stream itself is on /dev/video0
+    500 capture_failed   v4l2-ctl failed before streaming started
+
+Standard library only: the board may sit on a network with no internet.
+"""
+import argparse
+import fcntl
+import http.server
+import json
+import re
+import socket
+import socketserver
+import struct
+import subprocess
+import sys
+import threading
+import time
+import urllib.parse
+
+VERSION = "cam-still 3"
+MAGIC = b"STL1"
+
+ap = argparse.ArgumentParser()
+ap.add_argument("--port", type=int, default=8081)
+ap.add_argument("--bind", default="0.0.0.0")
+ap.add_argument("--device", default="/dev/video0", help="ISP main path")
+ap.add_argument("--width", type=int, default=3280)
+ap.add_argument("--height", type=int, default=2464)
+ap.add_argument("--max-frames", type=int, default=128)
+ap.add_argument("--v4l2-ctl", default="v4l2-ctl",
+                help="path to v4l2-ctl; tests/fake_v4l2ctl.py for tests without a camera")
+ap.add_argument("--no-system-checks", action="store_true",
+                help="skip the rkaiq_3A / main-path checks (tests without systemd)")
+ap.add_argument("--ring", type=int, default=8, help="series mode: frames kept in memory (fresh requests take up to ring-2)")
+A = ap.parse_args()
+
+if A.width % 16 or A.height % 16:
+    sys.exit("frame size must be a multiple of 16 (docs/radxa-zero3.md, RGA pitfall)")
+
+# Same neighbourhood as still_grab.py: exposure-1, again-1, dgain+1 for the
+# default measurement mode; stepping down unless already at the minimum.
+CTRL_MIN = {"exposure": 0, "analogue_gain": 256, "gain": 256}
+CTRLS = ("exposure", "analogue_gain", "gain")
+
+LOCK = threading.Lock()
+
+
+def log(*m):
+    print(*m, file=sys.stderr, flush=True)
+
+
+def run(args, timeout=10):
+    return subprocess.run(args, capture_output=True, text=True, timeout=timeout)
+
+
+def autoexposure_on():
+    if A.no_system_checks:
+        return False
+    return run(["systemctl", "is-active", "rkaiq_3A"]).stdout.strip() == "active"
+
+
+def main_path_user():
+    """The live stream's gst pipeline, if it reads the main path itself."""
+    if A.no_system_checks:
+        return ""
+    r = run(["pgrep", "-af", "v4l2src device=%s " % A.device])
+    return r.stdout.strip()
+
+
+def get_controls():
+    r = run([A.v4l2_ctl, "-d", A.device, "--get-ctrl=" + ",".join(CTRLS)])
+    vals = {}
+    for line in r.stdout.splitlines():
+        m = re.match(r"\s*(\w+)\s*:\s*(-?\d+)", line)
+        if m and m.group(1) in CTRLS:
+            vals[m.group(1)] = int(m.group(2))
+    return vals if len(vals) == len(CTRLS) else None
+
+
+def set_controls(vals):
+    arg = ",".join("%s=%d" % (k, vals[k]) for k in CTRLS)
+    subprocess.run([A.v4l2_ctl, "-d", A.device, "--set-ctrl=" + arg],
+                   check=True, stdout=subprocess.DEVNULL, stderr=sys.stderr, timeout=10)
+
+
+def set_format(w, h):
+    """Set NV12 WxH on the main path and read back stride / image size."""
+    r = run([A.v4l2_ctl, "-d", A.device, "--set-fmt-video=width=%d,height=%d,pixelformat=NV12" % (w, h)])
+    if r.returncode != 0:
+        raise RuntimeError("set-fmt: " + (r.stderr or r.stdout).strip()[-300:])
+    r = run([A.v4l2_ctl, "-d", A.device, "--get-fmt-video"])
+    text = r.stdout
+    gw = re.search(r"Width/Height\s*:\s*(\d+)/(\d+)", text)
+    if not gw or (int(gw.group(1)), int(gw.group(2))) != (w, h):
+        raise RuntimeError("the driver did not accept %dx%d NV12: %s" % (w, h, text.strip()[-300:]))
+    if "NV12" not in text:
+        raise RuntimeError("pixel format is not NV12: " + text.strip()[-300:])
+    bpl = re.search(r"Bytes per Line\s*:\s*(\d+)", text)
+    stride = int(bpl.group(1)) if bpl else w
+    # Frame size in the stream: v4l2-ctl --stream-to writes bytesused of every
+    # buffer, and still.py has always read exactly w*h*3/2 per frame (3280x2464
+    # packed) without losing sync. Size Image is only reported for diagnostics.
+    frame_bytes = stride * h * 3 // 2
+    si = re.search(r"Size Image\s*:\s*(\d+)", text)
+    if si and int(si.group(1)) != frame_bytes:
+        log("warning: Size Image %s != stride*h*3/2 = %d" % (si.group(1), frame_bytes))
+    return stride, frame_bytes
+
+
+def read_exact(f, view):
+    """Fill the memoryview from the pipe; False on EOF."""
+    got = 0
+    while got < len(view):
+        k = f.readinto(view[got:])
+        if not k:
+            return False
+        got += k
+    return True
+
+
+class Series:
+    """One long v4l2-ctl stream on the main path for fresh=1 requests (module docstring)."""
+
+    POST = 4          # frames dropped after the start-up reassert, as in the one-shot capture
+
+    def __init__(self):
+        self.cond = threading.Condition()
+        self.proc = None
+        self.error = None
+        self.seq = 0              # frames fully read from the pipe
+        self.marks = []           # dequeue times from '<' on stderr, index = frame number - 1
+        self.valid_from = 1       # first frame number with the controls settled
+        self.keep_until = 0.0
+        self.clients = 0
+        self.slots = []
+        self.pinned = None
+        self.stride = self.frame_bytes = 0
+        self.ctl = None
+        self.started = 0.0
+
+    def running(self):
+        return self.proc is not None and self.proc.poll() is None and self.error is None
+
+    def status(self):
+        with self.cond:
+            return {"running": self.running(), "frames": self.seq, "error": self.error,
+                    "keep_s": round(max(0.0, self.keep_until - time.monotonic()), 1),
+                    "age_s": round(time.monotonic() - self.started, 1) if self.running() else None}
+
+    def start(self, keep):
+        """Start the stream if it is not running; returns an error text or None. Caller holds LOCK."""
+        with self.cond:
+            self.keep_until = max(self.keep_until, time.monotonic() + keep)
+            if self.running():
+                return None
+        self.stop()
+        w, h = A.width, A.height
+        stride, frame_bytes = set_format(w, h)
+        ctl = get_controls()
+        cmd = [A.v4l2_ctl, "-d", A.device,
+               "--set-fmt-video=width=%d,height=%d,pixelformat=NV12" % (w, h),
+               "--stream-mmap=4", "--stream-to=-"]
+        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, bufsize=0)
+        try:
+            fcntl.fcntl(proc.stdout.fileno(), 1031, 1 << 20)     # F_SETPIPE_SZ: fewer wake-ups per 12 MB frame
+        except OSError:
+            pass
+        with self.cond:
+            self.proc, self.error, self.seq, self.marks = proc, None, 0, []
+            self.valid_from = 1 + 1 + self.POST
+            self.stride, self.frame_bytes, self.ctl = stride, frame_bytes, ctl
+            # [buffer, frame number (-1 while being written)]
+            self.slots = [[bytearray(frame_bytes), 0] for _ in range(max(4, A.ring))]
+            self.scratch = bytearray(frame_bytes)
+            self.pinned = None        # (first, last) frame numbers a request is sending
+            self.started = time.monotonic()
+            self.keep_until = time.monotonic() + keep
+        threading.Thread(target=self._read_frames, args=(proc,), daemon=True).start()
+        threading.Thread(target=self._read_marks, args=(proc, ctl), daemon=True).start()
+        threading.Thread(target=self._watch, args=(proc,), daemon=True).start()
+        log("SERIES start %dx%d, controls %s, keep %.0f s" % (w, h, ctl, keep))
+        return None
+
+    def stop(self, why="stop"):
+        with self.cond:
+            proc, self.proc = self.proc, None
+            self.cond.notify_all()
+        if proc is not None:
+            if proc.poll() is None:
+                proc.kill()
+            proc.wait()
+            log("SERIES %s after %d frames" % (why, self.seq))
+
+    def _fail(self, proc, text):
+        with self.cond:
+            if self.proc is proc and self.error is None:
+                self.error = text
+            self.cond.notify_all()
+
+    def _read_marks(self, proc, ctl):
+        err = bytearray()
+        n = 0
+        while True:
+            c = proc.stderr.read(1)
+            if not c:
+                break
+            if c != b"<":
+                err += c
+                continue
+            n += 1
+            with self.cond:
+                if self.proc is not proc:
+                    return
+                self.marks.append(time.monotonic())
+                self.cond.notify_all()
+            if n == 1 and ctl:
+                # right after a pipeline start the sensor may not hold the cached value (module docstring)
+                try:
+                    set_controls({k: v - 1 if v > CTRL_MIN[k] else v + 1 for k, v in ctl.items()})
+                    set_controls(ctl)
+                except Exception as e:
+                    log("series reassert failed: %s" % e)
+        if proc.poll() is None or proc.wait() != 0:
+            self._fail(proc, "v4l2-ctl stopped: " + err.decode(errors="replace").strip()[-300:])
+
+    def _read_frames(self, proc):
+        f = proc.stdout
+        while True:
+            with self.cond:
+                if self.proc is not proc:
+                    return
+                slot = self.slots[self.seq % len(self.slots)]
+                # a slow client is still sending the frame in this slot: drop the new frame instead
+                keep = self.pinned is not None and self.pinned[0] <= slot[1] <= self.pinned[1]
+                if not keep:
+                    slot[1] = -1      # being overwritten
+            if not read_exact(f, memoryview(self.scratch if keep else slot[0])):
+                self._fail(proc, "stream ended")
+                return
+            with self.cond:
+                self.seq += 1
+                if not keep:
+                    slot[1] = self.seq
+                self.cond.notify_all()
+
+    def pin(self, first, n, on):
+        """Keep frames first..first+n-1 from being overwritten while they are sent (n <= ring - 2)."""
+        with self.cond:
+            self.pinned = (first, first + n - 1) if on else None
+
+    def _watch(self, proc):
+        last, t_last = -1, time.monotonic()
+        while True:
+            time.sleep(0.5)
+            with self.cond:
+                if self.proc is not proc:
+                    return
+                now = time.monotonic()
+                if self.seq != last:
+                    last, t_last = self.seq, now
+                idle = self.clients == 0 and now > self.keep_until
+                stalled = now - t_last > 5
+            if stalled:
+                self._fail(proc, "no frames for 5 s")
+                self.stop("stalled")
+                return
+            if idle:
+                self.stop("idle")
+                return
+
+    def frame(self, number, deadline):
+        """Wait for frame `number` (1-based); returns the slot buffer or raises."""
+        with self.cond:
+            while self.seq < number:
+                if self.error or self.proc is None:
+                    raise RuntimeError(self.error or "series stopped")
+                left = deadline - time.monotonic()
+                if left <= 0:
+                    raise RuntimeError("frame %d did not come in time (have %d)" % (number, self.seq))
+                self.cond.wait(left)
+            slot = self.slots[(number - 1) % len(self.slots)]
+            if slot[1] != number:
+                raise RuntimeError("frame %d was overwritten: the client reads slower than the camera" % number)
+            return slot
+
+    def latest(self, after, deadline):
+        """Newest settled frame with a number > after: (number, slot). Frames in between are dropped (focus mode)."""
+        with self.cond:
+            while self.seq <= after or self.seq < self.valid_from:
+                if self.error or self.proc is None:
+                    raise RuntimeError(self.error or "series stopped")
+                left = deadline - time.monotonic()
+                if left <= 0:
+                    raise RuntimeError("no new frame in time (have %d)" % self.seq)
+                self.cond.wait(left)
+            return self.seq, self.slots[(self.seq - 1) % len(self.slots)]
+
+    def fps(self):
+        with self.cond:
+            m = self.marks[-11:]
+        return round((len(m) - 1) / (m[-1] - m[0]), 2) if len(m) >= 3 and m[-1] > m[0] else None
+
+    def first_fresh(self, t_req, skip, settle, deadline):
+        """Number of the first frame to send: dequeued after t_req, minus skip/settle."""
+        with self.cond:
+            while True:
+                if self.error or self.proc is None:
+                    raise RuntimeError(self.error or "series stopped")
+                after = [i + 1 for i, t in enumerate(self.marks) if t > t_req]
+                if after:
+                    return max(after[0] + skip + settle, self.valid_from)
+                left = deadline - time.monotonic()
+                if left <= 0:
+                    raise RuntimeError("no frame after the request")
+                self.cond.wait(left)
+
+
+SERIES = Series()
+
+# Focus mode (cam-still 3): one client at a time; a new /focus/stream takes over from the old one
+FOCUS = {"gen": 0, "client": None, "since": None, "packets": 0}
+FOCUS_LOCK = threading.Lock()
+FOCUS_MAX_RECTS = 8
+FOCUS_RECT = (16, 512)          # side of a crop, px
+FOCUS_STEPS = (0, 2, 4, 8, 16)  # overview decimation; 0 - no overview
+
+
+def parse_rects(text, w, h):
+    """'x,y,w,h;x,y,w,h' -> [(x, y, w, h)], clipped into the frame; ValueError on nonsense."""
+    rects = []
+    for part in filter(None, text.split(";")):
+        x, y, rw, rh = (int(v) for v in part.split(","))
+        if not (FOCUS_RECT[0] <= rw <= FOCUS_RECT[1] and FOCUS_RECT[0] <= rh <= FOCUS_RECT[1]):
+            raise ValueError("crop side %d..%d" % FOCUS_RECT)
+        rw, rh = min(rw, w), min(rh, h)
+        rects.append((min(max(x, 0), w - rw), min(max(y, 0), h - rh), rw, rh))
+    if len(rects) > FOCUS_MAX_RECTS:
+        raise ValueError("at most %d crops" % FOCUS_MAX_RECTS)
+    return rects
+
+
+def focus_packet(buf, stride, w, h, rects, step, head):
+    """One frame of the focus stream: Y of each crop and a decimated Y overview, no copies of the whole frame."""
+    parts = []
+    for x, y, rw, rh in rects:
+        parts.append(b"".join(buf[(y + r) * stride + x:(y + r) * stride + x + rw] for r in range(rh)))
+    if step:
+        ow, oh = len(range(0, w, step)), len(range(0, h, step))
+        parts.append(b"".join(buf[r * stride:r * stride + w:step] for r in range(0, h, step)))
+        head["overview"] = [ow, oh, step]
+    head["rects"] = [list(r) for r in rects]
+    js = json.dumps(head).encode()
+    return [FOCUS_MAGIC, struct.pack("<I", len(js)), js] + parts
+
+
+FOCUS_MAGIC = b"FCS1"
+
+
+class Handler(http.server.BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+    server_version = VERSION
+
+    def log_message(self, fmt, *args):
+        log("%s %s" % (self.address_string(), fmt % args))
+
+    def _json(self, code, obj):
+        data = json.dumps(obj, ensure_ascii=False).encode("utf-8")
+        self.send_response(code)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(data)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(data)
+
+    def _error(self, code, err, msg):
+        self._json(code, {"error": err, "message": msg})
+
+    def _busy(self):
+        who = FOCUS["client"]
+        self._error(409, "busy", "focus mode is running (%s), close /focus" % who if who
+                    else "another capture is running")
+
+    def _page(self, html):
+        data = html.encode("utf-8")
+        self.send_response(200)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(data)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(data)
+
+    def do_GET(self):
+        u = urllib.parse.urlparse(self.path)
+        q = urllib.parse.parse_qs(u.query)
+        if u.path == "/status":
+            self._json(200, {"service": VERSION, "busy": LOCK.locked(), "device": A.device,
+                             "width": A.width, "height": A.height, "max_frames": A.max_frames,
+                             "autoexposure": autoexposure_on(), "series": SERIES.status(),
+                             "focus": {"active": FOCUS["client"] is not None, "client": FOCUS["client"],
+                                       "since": FOCUS["since"], "packets": FOCUS["packets"]}})
+        elif u.path == "/still":
+            self.still(q)
+        elif u.path == "/focus":
+            self._page(FOCUS_PAGE)
+        elif u.path == "/focus/stream":
+            self.focus_stream(q)
+        elif u.path == "/series/stop":
+            with LOCK:
+                SERIES.stop()
+            self._json(200, {"ok": True, "series": SERIES.status()})
+        else:
+            self._error(404, "not_found", u.path)
+
+    def still(self, q):
+        t_req = time.monotonic()
+        try:
+            n = int(q.get("frames", ["16"])[0])
+            pre = int(q.get("pre", ["1"])[0])
+            post = int(q.get("post", ["4"])[0])
+            reassert = q.get("reassert", ["1"])[0] != "0"
+            fresh = q.get("fresh", ["0"])[0] == "1"
+            skip = int(q.get("skip", ["2"])[0])
+            settle = int(q.get("settle", ["0"])[0])
+            keep = float(q.get("keep", ["10"])[0])
+        except ValueError:
+            return self._error(400, "bad_request", "frames/pre/post/skip/settle must be integers, keep a number")
+        if not (1 <= n <= A.max_frames) or not (1 <= pre <= 10) or not (0 <= post <= 30):
+            return self._error(400, "bad_request",
+                               "frames 1..%d, pre 1..10, post 0..30" % A.max_frames)
+        if not (0 <= skip <= 10) or not (0 <= settle <= 30) or not (1 <= keep <= 60):
+            return self._error(400, "bad_request", "skip 0..10, settle 0..30, keep 1..60")
+        if fresh and n > max(4, A.ring) - 2:
+            return self._error(400, "bad_request", "fresh: frames 1..%d (ring %d)" % (max(4, A.ring) - 2, max(4, A.ring)))
+        if not LOCK.acquire(blocking=False):
+            return self._busy()
+        try:
+            if fresh:
+                self.capture_fresh(n, skip, settle, keep, t_req)
+            else:
+                SERIES.stop("one-shot request")
+                self.capture(n, pre, post, reassert)
+        finally:
+            LOCK.release()
+
+    def series_refusal(self):
+        """The checks of the one-shot path, once per series: True if an error was sent."""
+        if SERIES.running():
+            return False
+        if autoexposure_on():
+            self._error(409, "autoexposure", "rkaiq_3A is running; switch to manual exposure via the panel (:8080)")
+            return True
+        who = main_path_user()
+        if who:
+            self._error(503, "main_path_busy", "the live stream reads %s itself (mode wider than 1920?): %s"
+                        % (A.device, who[:160]))
+            return True
+        return False
+
+    def focus_stream(self, q):
+        """Endless stream of FCS1 packets: Y crops at full resolution + a decimated overview, newest frame each time.
+
+        Takes over from a previous focus client (the browser reconnects when the crops change). Holds LOCK while
+        it runs: stills get 409 busy, focus mode is a set-up mode of its own."""
+        w, h = A.width, A.height
+        try:
+            rects = parse_rects(q.get("rects", [""])[0], w, h)
+            step = int(q.get("ov", ["8"])[0])
+            if step not in FOCUS_STEPS:
+                raise ValueError("ov one of %s" % (FOCUS_STEPS,))
+            if not rects and not step:
+                raise ValueError("nothing to send: no crops and no overview")
+        except ValueError as e:
+            return self._error(400, "bad_request", "rects=x,y,w,h;... ov=N: %s" % e)
+        with FOCUS_LOCK:
+            FOCUS["gen"] += 1
+            gen = FOCUS["gen"]
+        if not LOCK.acquire(timeout=3):     # the previous focus client lets go on its next frame
+            return self._busy()
+        try:
+            if FOCUS["gen"] != gen:
+                return self._error(409, "busy", "superseded by a newer focus request")
+            if self.series_refusal():
+                return
+            try:
+                SERIES.start(10)
+            except Exception as e:
+                return self._error(500, "capture_failed", str(e))
+            with SERIES.cond:
+                SERIES.clients += 1
+            FOCUS.update(client=self.address_string(), since=time.strftime("%H:%M:%S"), packets=0)
+            try:
+                self.send_response(200)
+                self.send_header("Content-Type", "application/octet-stream")
+                self.send_header("Cache-Control", "no-store")
+                self.send_header("Connection", "close")
+                self.end_headers()
+                self.close_connection = True
+                self.connection.settimeout(5)   # a client gone silently (Wi-Fi) must not hold LOCK for minutes
+                log("FOCUS start %s: crops %s, overview %s" % (self.address_string(), rects, "1/%d" % step if step else "off"))
+                last, ctl, t_ctl, t0 = 0, None, 0.0, time.monotonic()
+                while FOCUS["gen"] == gen:
+                    number, slot = SERIES.latest(last, time.monotonic() + 15)
+                    if time.monotonic() - t_ctl > 2:
+                        ctl, t_ctl = get_controls(), time.monotonic()
+                    head = {"seq": number, "dropped": number - last - 1 if last else 0, "fps": SERIES.fps(),
+                            "controls": ctl, "width": w, "height": h, "service": VERSION}
+                    packet = focus_packet(slot[0], SERIES.stride, w, h, rects, step, head)
+                    if slot[1] != number:       # overwritten while cut: take the next one
+                        last = number
+                        continue
+                    self.wfile.write(b"".join(packet))
+                    self.wfile.flush()
+                    last = number
+                    FOCUS["packets"] += 1
+                    with SERIES.cond:
+                        SERIES.keep_until = max(SERIES.keep_until, time.monotonic() + 10)
+                log("FOCUS %s superseded after %d packets, %.0f s" % (self.address_string(), FOCUS["packets"],
+                                                                     time.monotonic() - t0))
+            except (BrokenPipeError, ConnectionResetError, TimeoutError) as e:
+                log("FOCUS %s went away after %d packets: %s" % (self.address_string(), FOCUS["packets"], e))
+            except RuntimeError as e:
+                log("FOCUS %s broke: %s" % (self.address_string(), e))
+            finally:
+                FOCUS["client"] = None
+                with SERIES.cond:
+                    SERIES.clients -= 1
+        finally:
+            LOCK.release()
+
+    def capture_fresh(self, n, skip, settle, keep, t_req):
+        if self.series_refusal():
+            return
+        try:
+            SERIES.start(keep)
+        except Exception as e:
+            return self._error(500, "capture_failed", str(e))
+        with SERIES.cond:
+            SERIES.clients += 1
+        first = None
+        try:
+            deadline = time.monotonic() + 15 + 1.0 * (n + skip + settle + Series.POST)
+            try:
+                ctl = get_controls()        # the client checks them against what it asked for
+                first = SERIES.first_fresh(t_req, skip, settle, deadline)
+                SERIES.pin(first, n, True)
+                slot = SERIES.frame(first, deadline)
+            except Exception as e:
+                SERIES.stop("failed")
+                return self._error(500, "capture_failed", str(e))
+            w, h = A.width, A.height
+            head = json.dumps({"format": "NV12", "width": w, "height": h, "stride": SERIES.stride,
+                               "frame_bytes": SERIES.frame_bytes, "frames": n, "skip": first - 1,
+                               "controls": ctl, "device": A.device, "service": VERSION,
+                               "series": {"first": first, "skip": skip, "settle": settle}}).encode()
+            prefix = MAGIC + struct.pack("<I", len(head)) + head
+            self.send_response(200)
+            self.send_header("Content-Type", "application/octet-stream")
+            self.send_header("Content-Length", str(len(prefix) + n * SERIES.frame_bytes))
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("Connection", "close")
+            self.end_headers()
+            self.wfile.write(prefix)
+            self.wfile.flush()
+            self.close_connection = True
+            sock = self.connection
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 4 << 20)
+            t_first = time.monotonic()
+            for k in range(n):
+                number = first + k
+                try:
+                    slot = slot if k == 0 else SERIES.frame(number, deadline)
+                    sock.sendall(memoryview(slot[0]))
+                    if slot[1] != number:
+                        raise RuntimeError("frame %d was overwritten while being sent" % number)
+                except (BrokenPipeError, ConnectionResetError) as e:
+                    log("fresh capture: client went away: %s" % e)
+                    return
+                except Exception as e:
+                    # the header is out: the client sees a short body
+                    log("fresh capture broke on frame %d of %d: %s" % (k + 1, n, e))
+                    return
+            with SERIES.cond:
+                SERIES.keep_until = max(SERIES.keep_until, time.monotonic() + keep)
+            t_end = time.monotonic()
+            log("FRESH %d frames from #%d (skip %d, settle %d), wait %.2f s, send %.2f s, controls %s"
+                % (n, first, skip, settle, t_first - t_req, t_end - t_first, ctl))
+        finally:
+            if first is not None:
+                SERIES.pin(first, n, False)
+            with SERIES.cond:
+                SERIES.clients -= 1
+
+    def capture(self, n, pre, post, reassert):
+        if autoexposure_on():
+            return self._error(409, "autoexposure",
+                               "rkaiq_3A is running; switch to manual exposure via the panel (:8080)")
+        who = main_path_user()
+        if who:
+            return self._error(503, "main_path_busy",
+                               "the live stream reads %s itself (mode wider than 1920?): %s"
+                               % (A.device, who[:160]))
+        w, h = A.width, A.height
+        try:
+            stride, frame_bytes = set_format(w, h)
+            ctl = get_controls()
+        except Exception as e:
+            return self._error(500, "capture_failed", str(e))
+
+        head = json.dumps({"format": "NV12", "width": w, "height": h, "stride": stride,
+                           "frame_bytes": frame_bytes, "frames": n, "skip": pre + post,
+                           "controls": ctl, "device": A.device, "service": VERSION}).encode()
+        prefix = MAGIC + struct.pack("<I", len(head)) + head
+
+        cmd = [A.v4l2_ctl, "-d", A.device,
+               "--set-fmt-video=width=%d,height=%d,pixelformat=NV12" % (w, h),
+               "--stream-mmap=4", "--stream-skip=%d" % (pre + post),
+               "--stream-count=%d" % n, "--stream-to=-"]
+        self.send_response(200)
+        self.send_header("Content-Type", "application/octet-stream")
+        self.send_header("Content-Length", str(len(prefix) + n * frame_bytes))
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("Connection", "close")
+        self.end_headers()
+        self.wfile.write(prefix)
+        self.wfile.flush()
+        self.close_connection = True
+
+        sock = self.connection
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 4 << 20)
+        t0 = time.time()
+        # v4l2-ctl writes the frames into the socket itself (stdout = socket fd)
+        src = subprocess.Popen(cmd, stdout=sock.fileno(), stderr=subprocess.PIPE, bufsize=0)
+        # watchdog: a stalled pipeline must not hold the lock forever
+        limit = 15 + 1.0 * (n + pre + post)
+        timer = threading.Timer(limit, lambda: src.poll() is None and src.kill())
+        timer.start()
+        err = bytearray()
+        seen = 0
+        t_first = t_data = None
+        try:
+            while True:
+                c = src.stderr.read(1)
+                if not c:
+                    break
+                if c != b"<":        # v4l2-ctl prints '<' per dequeued frame, skipped ones too
+                    err += c
+                    continue
+                seen += 1
+                if seen == pre:
+                    t_first = time.time()
+                    if reassert and ctl:
+                        try:
+                            set_controls({k: v - 1 if v > CTRL_MIN[k] else v + 1 for k, v in ctl.items()})
+                            set_controls(ctl)
+                        except Exception as e:
+                            log("reassert failed: %s" % e)
+                if seen == pre + post + 1:
+                    t_data = time.time()
+            rc = src.wait()
+        finally:
+            timer.cancel()
+            if src.poll() is None:
+                src.kill()
+                src.wait()
+        t_end = time.time()
+        got = max(0, seen - pre - post)
+        if rc != 0 or got < n:
+            e = err.decode(errors="replace").strip()
+            log("capture broke: %d of %d frames dequeued, v4l2-ctl rc %s (client sees a short body) %s"
+                % (got, n, rc, e[-400:]))
+            return
+        fps = (n - 1) / (t_end - t_data) if n > 1 and t_data else 0.0
+        log("GRAB %d frames %dx%d, first frame %.2f s, warm-up %.2f s, frames %.2f s (%.1f fps), controls %s"
+            % (n, w, h, (t_first or t0) - t0, (t_data or t0) - t0, t_end - (t_data or t0), fps, ctl))
+
+
+class Server(socketserver.ThreadingMixIn, http.server.HTTPServer):
+    allow_reuse_address = True
+    daemon_threads = True
+
+
+# GET /focus: focus set-up page (cam-still 3). Talks only to /focus/stream of this service.
+FOCUS_PAGE = r'''<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Camera focus</title>
+<style>
+  :root { --bg:#14161a; --card:#1d2026; --ink:#e8eaed; --muted:#9aa0a6; --line:#2f333b; --accent:#4c8dff;
+          --ok:#3ecf8e; --warn:#f5b041; --bad:#ff6b6b; }
+  * { box-sizing: border-box; }
+  body { margin:0; background:var(--bg); color:var(--ink); font:14px/1.4 system-ui,-apple-system,"Segoe UI",sans-serif; }
+  .wrap { padding:12px 16px; max-width:1800px; margin:0 auto; }
+  h1 { font-size:18px; margin:0 0 4px; font-weight:600; }
+  .bar { display:flex; gap:10px; flex-wrap:wrap; align-items:center; margin:8px 0; }
+  .bar label { color:var(--muted); }
+  select, button { background:var(--card); color:var(--ink); border:1px solid var(--line); border-radius:7px;
+                   padding:6px 10px; font:inherit; cursor:pointer; }
+  button.primary { background:var(--accent); border-color:var(--accent); color:#fff; }
+  #status { color:var(--muted); font-variant-numeric:tabular-nums; }
+  #status.bad { color:var(--bad); }
+  .main { display:flex; gap:14px; flex-wrap:wrap; align-items:flex-start; }
+  .ov { flex:0 1 560px; min-width:280px; }
+  #ovc { width:100%; display:block; background:#000; border:1px solid var(--line); border-radius:6px; cursor:crosshair; }
+  .tiles { flex:1 1 600px; display:flex; flex-wrap:wrap; gap:12px; align-items:flex-start; }
+  .tile { background:var(--card); border:2px solid var(--line); border-radius:8px; padding:8px; }
+  .tile.active { border-color:var(--accent); }
+  .tile canvas.crop { display:block; image-rendering:pixelated; image-rendering:crisp-edges; background:#000; cursor:pointer; }
+  .tile .head { display:flex; justify-content:space-between; align-items:baseline; gap:8px; margin-bottom:6px; }
+  .tile .name { font-weight:600; }
+  .tile .score { font-size:26px; font-weight:600; font-variant-numeric:tabular-nums; }
+  .tile .pct { font-variant-numeric:tabular-nums; color:var(--muted); }
+  .meter { height:8px; background:#000; border-radius:4px; overflow:hidden; margin:6px 0 4px; }
+  .meter div { height:100%; width:0; background:var(--warn); }
+  .meter div.top { background:var(--ok); }
+  canvas.spark { display:block; width:100%; height:60px; }
+  .clip { color:var(--bad); font-weight:600; }
+  .note { color:var(--muted); font-size:12px; margin-top:8px; }
+  .sw { display:inline-block; width:10px; height:10px; border-radius:2px; margin-right:6px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>Camera focus — full-frame crops</h1>
+  <div class="bar">
+    <label>Crop <select id="size"></select></label>
+    <label>Zoom <select id="zoom"><option>1</option><option>2</option><option>3</option><option>4</option><option>6</option></select></label>
+    <label>Overview <select id="ov"><option value="4">1/4</option><option value="8">1/8</option><option value="16">1/16</option><option value="0">off</option></select></label>
+    <label><input type="checkbox" id="stretch"> stretch contrast</label>
+    <button id="add">+ crop</button>
+    <button id="del">− active</button>
+    <button id="reset" class="primary">Reset peaks (R)</button>
+    <button id="defaults">Default: centre and two edges</button>
+  </div>
+  <div class="bar"><span id="status">connecting…</span></div>
+  <div class="main">
+    <div class="tiles" id="tiles"></div>
+    <div class="ov">
+      <canvas id="ovc" width="410" height="308"></canvas>
+      <div class="note">A click on the overview sets the centre of the active crop (digits 1…8 or a click on a tile select
+        the active one). Sharpness is the gradient energy (central differences) divided by the squared mean luma
+        minus black 16: almost independent of exposure; compare only within one crop.
+        Peak is the maximum since the last reset: turn the lens until every crop comes up to its peak.
+        Overexposure in a crop (≥ 250) spoils the metric — lower the exposure in the panel (:8080) or move the crop.
+        While the page is open, the service's stills get 409 busy.</div>
+    </div>
+  </div>
+</div>
+<script>
+const COLORS = ['#ff6b6b', '#4c8dff', '#3ecf8e', '#f5b041', '#c77dff', '#4dd0e1', '#ff8fab', '#b0bec5'];
+const SIZES = [64, 100, 128, 160, 200, 256, 320, 400, 512];
+const BLACK = 16, HISTORY = 400, EMA = 0.35, CLIP = 250;
+let W = 3280, H = 2464;
+const store = (() => { try { return JSON.parse(localStorage.getItem('focus.v1')) || {}; } catch (e) { return {}; } })();
+const S = {
+  size: store.size || 128, zoom: store.zoom || 3, ov: store.ov ?? 8, stretch: !!store.stretch,
+  rois: store.rois || defaultRois(), active: 0,
+};
+function defaultRois() { return [[0.12, 0.5], [0.5, 0.5], [0.88, 0.5]].map(([u, v]) => ({ x: Math.round(u * W), y: Math.round(v * H) })); }
+function save() {
+  try { localStorage.setItem('focus.v1', JSON.stringify({ size: S.size, zoom: S.zoom, ov: S.ov, stretch: S.stretch, rois: S.rois })); } catch (e) {}
+}
+const $ = id => document.getElementById(id);
+for (const s of SIZES) $('size').add(new Option(s + '×' + s, s));
+$('size').value = S.size; $('zoom').value = S.zoom; $('ov').value = S.ov; $('stretch').checked = S.stretch;
+
+// ---------- per-crop state and tiles ----------
+let tiles = [];
+function rectOf(r) {
+  const s = Math.min(S.size, W, H);
+  return [Math.min(Math.max(Math.round(r.x - s / 2), 0), W - s), Math.min(Math.max(Math.round(r.y - s / 2), 0), H - s), s, s];
+}
+function buildTiles() {
+  const box = $('tiles'); box.innerHTML = '';
+  tiles = S.rois.map((r, i) => {
+    const el = document.createElement('div'); el.className = 'tile';
+    el.innerHTML = `<div class="head"><span class="name"><span class="sw" style="background:${COLORS[i]}"></span>${i + 1}</span>
+      <span class="score">—</span></div><canvas class="crop"></canvas>
+      <div class="meter"><div></div></div><div class="head"><span class="pct">—</span><span class="pct pos"></span></div>
+      <canvas class="spark"></canvas>`;
+    el.querySelector('canvas.crop').onclick = () => setActive(i);
+    box.appendChild(el);
+    return { el, crop: el.querySelector('canvas.crop'), score: el.querySelector('.score'), pct: el.querySelector('.pct'),
+             pos: el.querySelector('.pos'), meter: el.querySelector('.meter div'), spark: el.querySelector('canvas.spark'),
+             ema: null, peak: 0, hist: [] };
+  });
+  setActive(Math.min(S.active, S.rois.length - 1));
+  sizeCrops();
+}
+function sizeCrops() {
+  const s = Math.min(S.size, W, H);
+  for (const t of tiles) { t.crop.width = s; t.crop.height = s; t.crop.style.width = t.crop.style.height = (s * S.zoom) + 'px';
+    t.spark.style.width = (s * S.zoom) + 'px'; }
+}
+function setActive(i) { S.active = i; tiles.forEach((t, k) => t.el.classList.toggle('active', k === i)); drawOverlay(); }
+function resetPeaks() { for (const t of tiles) { t.peak = 0; t.hist = []; t.ema = null; } }
+
+// ---------- metric ----------
+function sharpness(px, w, h) {
+  let sum = 0, g = 0;
+  for (let y = 1; y < h - 1; y++) {
+    const o = y * w;
+    for (let x = 1; x < w - 1; x++) {
+      const i = o + x, gx = px[i + 1] - px[i - 1], gy = px[i + w] - px[i - w];
+      g += gx * gx + gy * gy; sum += px[i];
+    }
+  }
+  const n = (w - 2) * (h - 2), m = Math.max(sum / n - BLACK, 1);
+  return 1000 * g / n / (m * m);
+}
+function drawGray(canvas, px, w, h, stretch) {
+  const ctx = canvas.getContext('2d'), img = ctx.createImageData(w, h), d = img.data;
+  let lo = 0, hi = 255;
+  if (stretch) {
+    const hist = new Uint32Array(256); for (let i = 0; i < px.length; i++) hist[px[i]]++;
+    const a = px.length * 0.005, b = px.length * 0.995; let c = 0; lo = -1; hi = 255;
+    for (let v = 0; v < 256; v++) { c += hist[v]; if (lo < 0 && c > a) lo = v; if (c >= b) { hi = v; break; } }
+    if (hi <= lo) hi = lo + 1;
+  }
+  const k = 255 / (hi - lo);
+  for (let i = 0, j = 0; i < px.length; i++, j += 4) {
+    const v = stretch ? Math.min(255, Math.max(0, (px[i] - lo) * k)) : px[i];
+    d[j] = d[j + 1] = d[j + 2] = v; d[j + 3] = 255;
+  }
+  ctx.putImageData(img, 0, 0);
+}
+function drawSpark(t) {
+  const c = t.spark, w = c.clientWidth || 200, h = 60;
+  if (c.width !== w) c.width = w; c.height = h;
+  const ctx = c.getContext('2d'); ctx.clearRect(0, 0, w, h);
+  if (t.hist.length < 2 || !t.peak) return;
+  const top = t.peak * 1.05, n = t.hist.length;
+  ctx.strokeStyle = '#3ecf8e'; ctx.setLineDash([4, 4]); ctx.beginPath();
+  ctx.moveTo(0, h - h * t.peak / top); ctx.lineTo(w, h - h * t.peak / top); ctx.stroke(); ctx.setLineDash([]);
+  ctx.strokeStyle = '#e8eaed'; ctx.lineWidth = 1.5; ctx.beginPath();
+  t.hist.forEach((v, i) => { const x = w * i / (HISTORY - 1) + (w * (HISTORY - n) / (HISTORY - 1)), y = h - h * v / top;
+    i ? ctx.lineTo(x, y) : ctx.moveTo(x, y); });
+  ctx.stroke();
+}
+
+// ---------- overview ----------
+let ovImg = null, ovStep = 8;
+function drawOverlay() {
+  const c = $('ovc'), ctx = c.getContext('2d');
+  if (ovImg) ctx.putImageData(ovImg, 0, 0); else { ctx.fillStyle = '#000'; ctx.fillRect(0, 0, c.width, c.height); }
+  const k = c.width / W;
+  ctx.lineWidth = 2; ctx.font = 'bold 14px system-ui';
+  S.rois.forEach((r, i) => {
+    const [x, y, w, h] = rectOf(r);
+    ctx.strokeStyle = COLORS[i]; ctx.fillStyle = COLORS[i];
+    ctx.strokeRect(x * k, y * k, Math.max(w * k, 3), Math.max(h * k, 3));
+    if (i === S.active) { ctx.setLineDash([3, 3]); ctx.strokeRect(x * k - 4, y * k - 4, w * k + 8, h * k + 8); ctx.setLineDash([]); }
+    ctx.fillText(String(i + 1), x * k + w * k + 4, y * k + 12);
+  });
+}
+$('ovc').addEventListener('click', e => {
+  const c = $('ovc'), b = c.getBoundingClientRect();
+  const x = (e.clientX - b.left) / b.width * W, y = (e.clientY - b.top) / b.height * H;
+  S.rois[S.active] = { x: Math.round(x), y: Math.round(y) };
+  const t = tiles[S.active]; t.peak = 0; t.hist = []; t.ema = null;
+  save(); drawOverlay(); reconnect();
+});
+
+// ---------- stream ----------
+let ctrl = null, retry = null, gotAt = [], bytesAt = [];
+function status(text, bad) { $('status').textContent = text; $('status').className = bad ? 'bad' : ''; }
+function reconnect() { clearTimeout(retry); retry = setTimeout(connect, 150); }
+async function connect() {
+  if (ctrl) ctrl.abort();
+  const my = ctrl = new AbortController();
+  const rects = S.rois.map(r => rectOf(r).join(',')).join(';');
+  const url = `/focus/stream?rects=${rects}&ov=${S.ov}`;
+  let r;
+  try { r = await fetch(url, { signal: my.signal, cache: 'no-store' }); }
+  catch (e) { if (my.signal.aborted) return; status('no connection to the service: ' + e.message, true); retry = setTimeout(connect, 1500); return; }
+  if (!r.ok) {
+    let msg = r.status + ''; try { const j = await r.json(); msg = `${r.status} ${j.error}: ${j.message}`; } catch (e) {}
+    status(msg + ' — retrying in 2 s', true); retry = setTimeout(connect, 2000); return;
+  }
+  status('streaming…');
+  const reader = r.body.getReader();
+  let buf = new Uint8Array(1 << 20), used = 0;
+  try {
+    for (;;) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      if (used + value.length > buf.length) { const nb = new Uint8Array(Math.max(buf.length * 2, used + value.length)); nb.set(buf.subarray(0, used)); buf = nb; }
+      buf.set(value, used); used += value.length;
+      bytesAt.push([performance.now(), value.length]);
+      let off = 0;
+      for (;;) {
+        if (used - off < 8) break;
+        if (buf[off] !== 70 || buf[off + 1] !== 67 || buf[off + 2] !== 83 || buf[off + 3] !== 49) throw new Error('stream out of sync');
+        const len = buf[off + 4] | buf[off + 5] << 8 | buf[off + 6] << 16 | buf[off + 7] << 24;
+        if (used - off < 8 + len) break;
+        const head = JSON.parse(new TextDecoder().decode(buf.subarray(off + 8, off + 8 + len)));
+        let need = head.rects.reduce((a, q) => a + q[2] * q[3], 0) + (head.overview ? head.overview[0] * head.overview[1] : 0);
+        if (used - off < 8 + len + need) break;
+        if (my === ctrl) onPacket(head, buf.subarray(off + 8 + len, off + 8 + len + need));
+        off += 8 + len + need;
+      }
+      if (off) { buf.copyWithin(0, off, used); used -= off; }
+    }
+    if (!my.signal.aborted) { status('the service closed the stream — reconnecting', true); retry = setTimeout(connect, 1000); }
+  } catch (e) {
+    if (my.signal.aborted) return;
+    status('stream interrupted: ' + e.message, true); retry = setTimeout(connect, 1000);
+  }
+}
+let lastDropped = 0;
+function onPacket(head, data) {
+  if (head.width !== W || head.height !== H) { W = head.width; H = head.height; }
+  const now = performance.now(); gotAt.push(now); while (gotAt.length && now - gotAt[0] > 3000) gotAt.shift();
+  while (bytesAt.length && now - bytesAt[0][0] > 3000) bytesAt.shift();
+  lastDropped = head.dropped;
+  let o = 0;
+  head.rects.forEach((q, i) => {
+    const [x, y, w, h] = q, px = data.subarray(o, o + w * h); o += w * h;
+    const t = tiles[i]; if (!t) return;
+    if (t.crop.width !== w) { t.crop.width = w; t.crop.height = h; }
+    drawGray(t.crop, px, w, h, S.stretch);
+    const v = sharpness(px, w, h);
+    t.ema = t.ema == null ? v : t.ema + EMA * (v - t.ema);
+    t.peak = Math.max(t.peak, t.ema);
+    t.hist.push(t.ema); if (t.hist.length > HISTORY) t.hist.shift();
+    const p = t.peak ? 100 * t.ema / t.peak : 0;
+    t.score.textContent = t.ema.toPrecision(4);
+    let clip = 0; for (let k = 0; k < px.length; k++) clip += px[k] >= CLIP;
+    clip = 100 * clip / px.length;
+    t.pct.innerHTML = p.toFixed(1) + ' % of peak' + (clip >= 1 ? ` · <span class="clip">overexposed ${clip.toFixed(0)} %</span>` : '');
+    t.pos.textContent = `x ${x + w / 2}, y ${y + h / 2}`;
+    t.meter.style.width = Math.max(0, Math.min(100, (p - 50) * 2)) + '%';
+    t.meter.classList.toggle('top', p >= 98);
+    drawSpark(t);
+  });
+  if (head.overview) {
+    const [ow, oh] = head.overview, px = data.subarray(o, o + ow * oh), c = $('ovc');
+    if (c.width !== ow || c.height !== oh) { c.width = ow; c.height = oh; }
+    const img = new ImageData(ow, oh);
+    for (let i = 0, j = 0; i < px.length; i++, j += 4) { img.data[j] = img.data[j + 1] = img.data[j + 2] = px[i]; img.data[j + 3] = 255; }
+    ovImg = img;
+  }
+  drawOverlay();
+  const fps = gotAt.length > 1 ? (gotAt.length - 1) / ((gotAt[gotAt.length - 1] - gotAt[0]) / 1000) : 0;
+  const mbs = bytesAt.reduce((a, b) => a + b[1], 0) / 3 / 1e6;
+  const c = head.controls ? `exposure ${head.controls.exposure}, gain ${head.controls.analogue_gain} / ${head.controls.gain}` : 'controls ?';
+  status(`frame #${head.seq} · display ${fps.toFixed(1)} fps · camera ${head.fps ?? '?'} fps · dropped ${lastDropped} · ${mbs.toFixed(2)} MB/s · ${c}`);
+}
+
+// ---------- controls ----------
+$('size').onchange = e => { S.size = +e.target.value; save(); sizeCrops(); resetPeaks(); drawOverlay(); reconnect(); };
+$('zoom').onchange = e => { S.zoom = +e.target.value; save(); sizeCrops(); };
+$('ov').onchange = e => { S.ov = +e.target.value; save(); reconnect(); };
+$('stretch').onchange = e => { S.stretch = e.target.checked; save(); };
+$('reset').onclick = resetPeaks;
+$('add').onclick = () => { if (S.rois.length >= 8) return; S.rois.push({ x: W / 2, y: H / 2 }); S.active = S.rois.length - 1; save(); buildTiles(); reconnect(); };
+$('del').onclick = () => { if (S.rois.length <= 1) return; S.rois.splice(S.active, 1); S.active = 0; save(); buildTiles(); reconnect(); };
+$('defaults').onclick = () => { S.rois = defaultRois(); S.active = 0; save(); buildTiles(); reconnect(); };
+document.addEventListener('keydown', e => {
+  if (e.target.tagName === 'SELECT' || e.target.tagName === 'INPUT') return;
+  if (e.key === 'r' || e.key === 'R' || e.key === 'к' || e.key === 'К') resetPeaks();
+  const k = +e.key; if (k >= 1 && k <= S.rois.length) setActive(k - 1);
+});
+window.addEventListener('pagehide', () => ctrl && ctrl.abort());
+buildTiles(); drawOverlay(); connect();
+</script>
+</body>
+</html>
+'''
+
+
+if __name__ == "__main__":
+    log("%s on %s:%d, %s %dx%d" % (VERSION, A.bind, A.port, A.device, A.width, A.height))
+    with Server((A.bind, A.port), Handler) as httpd:
+        httpd.serve_forever()

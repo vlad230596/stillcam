@@ -1,0 +1,18 @@
+# systemd unit for node/cam-still (docs/cam-still.md).
+# Installed as /etc/systemd/system/cam-still.service by install-cam-still.sh.
+[Unit]
+Description=cam-still: raw NV12 measurement stills from the ISP main path (:8081)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+# Same user still_grab.py ran as over ssh: it can open /dev/video0 and run
+# v4l2-ctl, and needs no root. systemctl is-active / pgrep work unprivileged.
+User=radxa
+ExecStart=/usr/bin/python3 /usr/local/bin/cam-still --port 8081
+Restart=on-failure
+RestartSec=2
+# journal: journalctl -u cam-still  (GRAB lines with timings, capture errors)
+
+[Install]
+WantedBy=multi-user.target

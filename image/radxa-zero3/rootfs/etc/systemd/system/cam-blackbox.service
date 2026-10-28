@@ -1,0 +1,11 @@
+[Unit]
+Description=radxa-cam health black box
+After=network.target
+
+[Service]
+ExecStart=/usr/local/bin/cam-blackbox
+Restart=always
+RestartSec=1
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,12 @@
+# cam-blackbox appends one line per second (~10 MB/day) and never reopens the
+# file, hence copytruncate.
+/var/log/cam-blackbox.log {
+    daily
+    rotate 14
+    maxsize 50M
+    compress
+    delaycompress
+    missingok
+    notifempty
+    copytruncate
+}

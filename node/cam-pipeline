@@ -1,0 +1,66 @@
+#!/bin/bash
+# Capture -> encode -> publish, built from /usr/local/etc/cam-stream.conf.
+# Called by mediamtx as runOnInit, which supplies $RTSP_PORT and $MTX_PATH.
+#
+# Two hard-won rules are encoded here, do not undo them casually:
+#
+# 1. GST_MPP_NO_RGA=1. The RGA driver in this kernel has an mm refcount bug -
+#    rga_request_put_current_mm() drops a reference it never took - which
+#    corrupts kernel memory and wedges the whole board minutes later, blaming
+#    whatever task ran next. The encoder only reaches for RGA when a frame needs
+#    converting, so every offered size is a multiple of 16 in both directions and
+#    RGA is forbidden outright. A size that would need conversion now fails to
+#    negotiate: loud, harmless, and obvious.
+#
+# 2. The sensor mode is NEVER pinned through the media controller. Doing that
+#    leaves the ISP dropping most frames - capture falls from ~18 fps to under 1 -
+#    and it survives until the next reboot. The driver picks the sensor mode
+#    itself, keeping it in full-frame 21 fps mode, so every resolution runs at
+#    ~19 fps. That is a deliberate trade of frame rate for stability.
+#
+# The stream runs on the ISP self path (/dev/video1, rkisp_selfpath, up to
+# 1920 wide), not the main path (/dev/video0, up to 3280x2464). Both paths come
+# off the same ISP frame and run in parallel, so host/still.py can read a
+# full 3280x2464 measurement frame from the main path without stopping the
+# stream. Checked 2026-09-23: 19.3 fps on the self path at exposure 2741, the
+# same as on the main path, and no RGA calls. The main path is only used for
+# the stream when the requested width does not fit the self path - and then a
+# still has to stop the stream, as it did before.
+export GST_MPP_NO_RGA=1
+
+CONF=/usr/local/etc/cam-stream.conf
+[ -f "$CONF" ] && . "$CONF"
+
+WIDTH="${WIDTH:-1920}"
+HEIGHT="${HEIGHT:-1088}"
+BITRATE="${BITRATE:-6000000}"
+GOP="${GOP:-30}"
+DEVICE="${DEVICE:-/dev/video1}"
+FPSFILE=/run/cam-fps
+
+# rkisp_selfpath tops out at 1920 wide; wider modes (the 3280x2464 full frame)
+# have to go through the main path.
+if [ "$DEVICE" = /dev/video1 ] && [ "$WIDTH" -gt 1920 ]; then
+    echo "cam-pipeline: ${WIDTH} wide does not fit the self path, using /dev/video0" >&2
+    DEVICE=/dev/video0
+fi
+
+echo "cam-pipeline: ${WIDTH}x${HEIGHT} on ${DEVICE}, ${BITRATE} bps, gop ${GOP}, RGA disabled" >&2
+: > "$FPSFILE"
+
+# A tee feeds a throwaway fpsdisplaysink which reports the delivered frame rate
+# once a second. gst-launch only prints that in verbose mode, and verbose mode is
+# far too chatty for the journal on an SD card, so stdout is filtered here: the
+# measured rate lands in $FPSFILE for the panel to read, everything else is
+# dropped. stderr is left alone so real errors still reach the journal.
+exec > >(stdbuf -oL grep --line-buffered -oE 'current: [0-9.]+' \
+         | while read -r _ value; do printf '%s\n' "$value" > "$FPSFILE"; done)
+
+exec gst-launch-1.0 -v \
+    v4l2src device="${DEVICE}" io-mode=4 ! \
+    "video/x-raw,format=NV12,width=${WIDTH},height=${HEIGHT}" ! \
+    mpph264enc bps="${BITRATE}" gop="${GOP}" ! \
+    h264parse config-interval=1 ! \
+    tee name=t \
+    t. ! queue ! rtspclientsink location="rtsp://127.0.0.1:${RTSP_PORT:-8554}/${MTX_PATH:-cam}" latency=0 \
+    t. ! queue ! fpsdisplaysink video-sink=fakesink text-overlay=false sync=false fps-update-interval=1000
